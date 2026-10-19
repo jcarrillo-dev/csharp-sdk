@@ -85,7 +85,8 @@ public abstract class JsonRpcMessage
             RequestId id = default;
             bool hasId = false;
             string? method = null;
-            JsonNode? parameters = null;
+            JsonElement parameters = default;
+            bool hasParameters = false;
             JsonRpcErrorDetail? error = null;
             JsonNode? result = null;
             bool hasResult = false;
@@ -127,7 +128,11 @@ public abstract class JsonRpcMessage
                         break;
 
                     case "params":
-                        parameters = JsonSerializer.Deserialize(ref reader, options.GetTypeInfo<JsonNode>());
+                        // Read params as a JsonElement, which is what deserializing a JsonNode does for objects and arrays.
+                        // A request keeps the element, so its handler can deserialize the params without a round trip
+                        // through JsonNode.
+                        parameters = JsonSerializer.Deserialize(ref reader, options.GetTypeInfo<JsonElement>());
+                        hasParameters = true;
                         break;
 
                     case "error":
@@ -168,12 +173,18 @@ public abstract class JsonRpcMessage
                 if (id.Id is not null)
                 {
                     // Messages with both method and id are requests
-                    return new JsonRpcRequest
+                    var request = new JsonRpcRequest
                     {
                         Id = id,
                         Method = method,
-                        Params = parameters
                     };
+
+                    if (hasParameters)
+                    {
+                        request.SetRawParams(parameters, new JsonNodeOptions { PropertyNameCaseInsensitive = options.PropertyNameCaseInsensitive });
+                    }
+
+                    return request;
                 }
                 else
                 {
@@ -181,7 +192,9 @@ public abstract class JsonRpcMessage
                     return new JsonRpcNotification
                     {
                         Method = method,
-                        Params = parameters
+                        Params = hasParameters
+                            ? JsonRpcRequest.CreateNode(parameters, new JsonNodeOptions { PropertyNameCaseInsensitive = options.PropertyNameCaseInsensitive })
+                            : null,
                     };
                 }
             }

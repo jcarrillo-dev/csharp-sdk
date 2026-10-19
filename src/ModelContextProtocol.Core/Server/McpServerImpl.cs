@@ -230,7 +230,7 @@ internal sealed partial class McpServerImpl : McpServer
             return;
         }
 
-        JsonObject? meta = request.Params is JsonObject paramsObj ? paramsObj["_meta"] as JsonObject : null;
+        JsonObject? meta = request.ParamsNode is JsonObject paramsObj ? paramsObj["_meta"] as JsonObject : null;
         // An unreadable value cannot select a protocol; only the modern path requires a usable version.
         string? metadataProtocolVersion =
             meta?[MetaKeys.ProtocolVersion] is JsonValue value && value.TryGetValue(out string? version) ? version : null;
@@ -2334,7 +2334,7 @@ internal sealed partial class McpServerImpl : McpServer
         _requestHandlers[method] = async (request, cancellationToken) =>
         {
             // Check for MRTR retry: if requestState is present, look up the continuation.
-            if (request.Params is JsonObject paramsObj &&
+            if (request.ParamsNode is JsonObject paramsObj &&
                 paramsObj.TryGetPropertyValue("requestState", out var requestStateNode) &&
                 requestStateNode?.GetValueKind() == JsonValueKind.String &&
                 requestStateNode.GetValue<string>() is { } requestState)

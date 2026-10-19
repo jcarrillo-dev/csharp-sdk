@@ -41,7 +41,7 @@ internal static class Diagnostics
         switch (message)
         {
             case JsonRpcRequest request:
-                meta = request.Params?["_meta"];
+                meta = request.ParamsNode?["_meta"];
                 break;
 
             case JsonRpcNotification notification:

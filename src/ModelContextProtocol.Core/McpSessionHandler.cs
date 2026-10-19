@@ -859,7 +859,7 @@ internal sealed partial class McpSessionHandler : IAsyncDisposable
     {
         JsonObject? paramsObj = message switch
         {
-            JsonRpcRequest request => request.Params as JsonObject,
+            JsonRpcRequest request => request.ParamsNode as JsonObject,
             JsonRpcNotification notification => notification.Params as JsonObject,
             _ => null
         };
@@ -935,7 +935,7 @@ internal sealed partial class McpSessionHandler : IAsyncDisposable
                 {
                     JsonObject? paramsObj = message switch
                     {
-                        JsonRpcRequest request => request.Params as JsonObject,
+                        JsonRpcRequest request => request.ParamsNode as JsonObject,
                         JsonRpcNotification notification => notification.Params as JsonObject,
                         _ => null
                     };

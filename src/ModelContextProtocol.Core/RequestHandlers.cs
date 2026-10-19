@@ -40,11 +40,20 @@ internal sealed class RequestHandlers : Dictionary<string, Func<JsonRpcRequest, 
 
         this[method] = async (request, cancellationToken) =>
         {
-            TParams typedRequest = JsonSerializer.Deserialize(request.Params, requestTypeInfo)!;
+            TParams typedRequest = DeserializeParams(request, requestTypeInfo);
             object? result = await handler(typedRequest, request, cancellationToken).ConfigureAwait(false);
             return JsonSerializer.SerializeToNode(result, responseTypeInfo);
         };
     }
+
+    /// <summary>
+    /// Deserializes the parameters of <paramref name="request"/>, from the raw JSON the request was read from when the
+    /// parameters have not been exposed for modification since, or from <see cref="JsonRpcRequest.Params"/> otherwise.
+    /// </summary>
+    private static TParams DeserializeParams<TParams>(JsonRpcRequest request, JsonTypeInfo<TParams> requestTypeInfo) =>
+        request.TryGetRawParams(out JsonElement rawParams)
+            ? JsonSerializer.Deserialize(rawParams, requestTypeInfo)!
+            : JsonSerializer.Deserialize(request.Params, requestTypeInfo)!;
 
 #pragma warning disable MCPEXP002 // SetWithAlternate consumes the experimental ResultOrAlternate seam
     /// <summary>
@@ -65,7 +74,7 @@ internal sealed class RequestHandlers : Dictionary<string, Func<JsonRpcRequest, 
 
         this[method] = async (request, cancellationToken) =>
         {
-            TParams typedRequest = JsonSerializer.Deserialize(request.Params, requestTypeInfo)!;
+            TParams typedRequest = DeserializeParams(request, requestTypeInfo);
             var augmented = await handler(typedRequest, request, cancellationToken).ConfigureAwait(false);
 
             if (augmented.IsAlternate)
