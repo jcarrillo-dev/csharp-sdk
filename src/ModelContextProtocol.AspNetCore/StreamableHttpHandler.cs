@@ -731,9 +731,9 @@ internal sealed class StreamableHttpHandler(
         [NotNullWhen(false)] out JsonRpcErrorDetail? errorDetail)
     {
         var protocolVersionHeader = context.Request.Headers[McpProtocolVersionHeaderName].ToString();
-        if (message is JsonRpcRequest { Params: var requestParams } &&
+        if (message is JsonRpcRequest request &&
             McpProtocolVersions.RequiresPerRequestMetadata(protocolVersionHeader) &&
-            (requestParams is not JsonObject paramsObj ||
+            (GetParamsForReading(request) is not JsonObject paramsObj ||
              paramsObj["_meta"] is not JsonObject metaObj ||
              metaObj[MetaKeys.ClientCapabilities] is not JsonObject))
         {
@@ -835,7 +835,8 @@ internal sealed class StreamableHttpHandler(
 
         var protocolVersionHeader = context.Request.Headers[McpProtocolVersionHeaderName].ToString();
 
-        if (message is JsonRpcRequest { Method: RequestMethods.Initialize, Params: JsonObject initializeParams } &&
+        if (message is JsonRpcRequest { Method: RequestMethods.Initialize } initializeRequest &&
+            GetParamsForReading(initializeRequest) is JsonObject initializeParams &&
             initializeParams["protocolVersion"] is JsonValue initializeProtocolVersionValue &&
             initializeProtocolVersionValue.TryGetValue(out string? initializeProtocolVersion) &&
             !string.IsNullOrEmpty(protocolVersionHeader) &&
@@ -895,14 +896,27 @@ internal sealed class StreamableHttpHandler(
         Message = message,
     };
 
+    /// <summary>
+    /// Gets the params of a request or notification for validation, which only reads them.
+    /// </summary>
+    /// <remarks>
+    /// Reading <see cref="JsonRpcRequest.Params"/> would make the request handler deserialize the params from the
+    /// <see cref="JsonNode"/> instead of from the JSON the request was read from.
+    /// </remarks>
+    private static JsonNode? GetParamsForReading(JsonRpcMessage message) => message switch
+    {
+        JsonRpcRequest request => GetParamsForReading(request),
+        JsonRpcNotification notification => notification.Params,
+        _ => null,
+    };
+
+#pragma warning disable MCPEXP002 // GetParamsForReading is experimental
+    private static JsonNode? GetParamsForReading(JsonRpcRequest request) => request.GetParamsForReading();
+#pragma warning restore MCPEXP002
+
     private static bool TryGetProtocolVersionMeta(JsonRpcMessage message, [NotNullWhen(true)] out string? protocolVersion)
     {
-        var parameters = message switch
-        {
-            JsonRpcRequest request => request.Params,
-            JsonRpcNotification notification => notification.Params,
-            _ => null,
-        };
+        var parameters = GetParamsForReading(message);
 
         string? value = null;
         if (parameters is JsonObject paramsObj &&
@@ -1033,12 +1047,7 @@ internal sealed class StreamableHttpHandler(
         }
 
         // Extract the params and name value from the body based on the method, if present.
-        var bodyParams = message switch
-        {
-            JsonRpcRequest request => request.Params,
-            JsonRpcNotification notification => notification.Params,
-            _ => null,
-        };
+        var bodyParams = GetParamsForReading(message);
         var mcpNameInBody = GetJsonNodeStringProperty(bodyParams, routingNameParameter);
 
         // Check that the header value matches the body value if the body value is present.
@@ -1102,7 +1111,8 @@ internal sealed class StreamableHttpHandler(
         [NotNullWhen(false)] out string? errorMessage)
     {
         // Custom param headers are only relevant for tools/call requests
-        if (message is not JsonRpcRequest { Method: RequestMethods.ToolsCall, Params: { } bodyParams })
+        if (message is not JsonRpcRequest { Method: RequestMethods.ToolsCall } request ||
+            GetParamsForReading(request) is not { } bodyParams)
         {
             errorMessage = null;
             return true;

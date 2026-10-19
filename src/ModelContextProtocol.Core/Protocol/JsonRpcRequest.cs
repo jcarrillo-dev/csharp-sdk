@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -70,6 +71,24 @@ public sealed class JsonRpcRequest : JsonRpcMessageWithId
             return _params;
         }
     }
+
+    /// <summary>
+    /// Gets the parameters for code that only reads them, such as a transport that validates a request before
+    /// passing it to the server.
+    /// </summary>
+    /// <returns>The same node as <see cref="Params"/>.</returns>
+    /// <remarks>
+    /// <para>
+    /// Reading <see cref="Params"/> tells the SDK that the parameters may have been modified, so the request handler
+    /// deserializes them from the <see cref="JsonNode"/>. This method returns the same node without doing that, so the
+    /// handler can still deserialize the parameters from the JSON the request was read from.
+    /// </para>
+    /// <para>
+    /// Callers must not modify the returned node. To modify the parameters, use <see cref="Params"/>.
+    /// </para>
+    /// </remarks>
+    [Experimental(Experimentals.Extensibility_DiagnosticId, UrlFormat = Experimentals.Extensibility_Url)]
+    public JsonNode? GetParamsForReading() => ParamsNode;
 
     /// <summary>
     /// Sets the parameters from the raw JSON the request was read from. The <see cref="JsonNode"/> is created on demand.
