@@ -10,6 +10,7 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.IO.Pipelines;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -713,6 +714,141 @@ public partial class McpServerBuilderExtensionsToolsTests : ClientServerTestBase
         Assert.Contains(services.GetServices<McpServerTool>(), t => t.ProtocolTool.Name == "method_c");
         Assert.Contains(services.GetServices<McpServerTool>(), t => t.ProtocolTool.Name == "method_d");
         Assert.Contains(services.GetServices<McpServerTool>(), t => t.ProtocolTool.Name == "Returns42");
+    }
+
+    [Fact]
+    public void WithTools_ConfigureOptions_InvokedForEachToolMethod()
+    {
+        List<MethodInfo> configuredMethods = [];
+        ServiceCollection sc = new();
+        sc.AddMcpServer().WithTools<EchoTool>((method, options) =>
+        {
+            Assert.NotNull(options.Services);
+            Assert.Same(BuilderToolsJsonContext.Default.Options, options.SerializerOptions);
+
+            lock (configuredMethods)
+            {
+                configuredMethods.Add(method);
+            }
+
+            if (method.Name == nameof(EchoTool.EchoComplex))
+            {
+                options.Title = "Configured title";
+            }
+            else if (method.Name == nameof(EchoTool.Echo))
+            {
+                options.Description = "Configured description";
+            }
+        }, BuilderToolsJsonContext.Default.Options);
+        IServiceProvider services = sc.BuildServiceProvider();
+
+        McpServerTool[] tools = services.GetServices<McpServerTool>().ToArray();
+
+        MethodInfo[] expectedMethods = typeof(EchoTool)
+            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance)
+            .Where(m => m.GetCustomAttribute<McpServerToolAttribute>() is not null)
+            .ToArray();
+        Assert.Equal(expectedMethods.Length, tools.Length);
+        Assert.Equal(expectedMethods.OrderBy(m => m.Name), configuredMethods.OrderBy(m => m.Name));
+
+        // Values set by the callback take precedence over the values derived from attributes.
+        McpServerTool echoComplex = tools.Single(t => t.ProtocolTool.Name == "echo_complex");
+        Assert.Equal("Configured title", echoComplex.ProtocolTool.Title);
+        Assert.Equal("Configured title", echoComplex.ProtocolTool.Annotations?.Title);
+
+        McpServerTool echo = tools.Single(t => t.ProtocolTool.Name == "echo");
+        Assert.Equal("Configured description", echo.ProtocolTool.Description);
+
+        // Values not set by the callback are still derived from attributes.
+        McpServerTool returnInteger = tools.Single(t => t.ProtocolTool.Name == "return_integer");
+        Assert.Equal("Return An Integer", returnInteger.ProtocolTool.Title);
+    }
+
+    [Fact]
+    public void WithTools_ConfigureOptions_CanSetSchemaCreateOptions()
+    {
+        ServiceCollection sc = new();
+        sc.AddMcpServer().WithTools<EchoTool>((method, options) =>
+        {
+            options.SchemaCreateOptions = new()
+            {
+                TransformSchemaNode = static (context, node) =>
+                {
+                    if (node is JsonObject obj && obj["type"] is JsonValue type && type.TryGetValue(out string? typeName) && typeName == "string")
+                    {
+                        obj["x-configured"] = true;
+                    }
+
+                    return node;
+                },
+            };
+        }, BuilderToolsJsonContext.Default.Options);
+        IServiceProvider services = sc.BuildServiceProvider();
+
+        McpServerTool echo = services.GetServices<McpServerTool>().Single(t => t.ProtocolTool.Name == "echo");
+
+        JsonElement message = echo.ProtocolTool.InputSchema.GetProperty("properties").GetProperty("message");
+        Assert.True(message.GetProperty("x-configured").GetBoolean());
+    }
+
+    [Fact]
+    public void WithTools_ToolTypes_ConfigureOptions_InvokedForEachToolMethod()
+    {
+        ServiceCollection sc = new();
+        sc.AddMcpServer().WithTools(
+            [typeof(AnotherToolType), typeof(ToolTypeWithNoAttribute)],
+            (method, options) => options.Name = $"configured_{method.Name}",
+            BuilderToolsJsonContext.Default.Options);
+        IServiceProvider services = sc.BuildServiceProvider();
+
+        Assert.Equal(
+            ["configured_MethodA", "configured_MethodB", "configured_MethodC", "configured_MethodD"],
+            services.GetServices<McpServerTool>().Select(t => t.ProtocolTool.Name).OrderBy(n => n, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void WithToolsFromAssembly_ConfigureOptions_InvokedForEachToolMethod()
+    {
+        if (!JsonSerializer.IsReflectionEnabledByDefault)
+        {
+            return;
+        }
+
+        ConcurrentBag<MethodInfo> configuredMethods = [];
+        ServiceCollection sc = new();
+        sc.AddMcpServer().WithToolsFromAssembly(typeof(EchoTool).Assembly, (method, options) =>
+        {
+            configuredMethods.Add(method);
+            if (method.DeclaringType == typeof(EchoTool) && method.Name == nameof(EchoTool.Echo))
+            {
+                options.Title = "Configured title";
+            }
+        });
+        IServiceProvider services = sc.BuildServiceProvider();
+
+        McpServerTool[] tools = services.GetServices<McpServerTool>().ToArray();
+
+        Assert.Equal(tools.Length, configuredMethods.Count);
+        Assert.Contains(configuredMethods, m => m.DeclaringType == typeof(AnotherToolType) && m.Name == "MethodA");
+        MethodInfo echoMethod = typeof(EchoTool).GetMethod(nameof(EchoTool.Echo))!;
+        Assert.Equal("Configured title", tools.Single(t => t.Metadata.Contains(echoMethod)).ProtocolTool.Title);
+    }
+
+    [Fact]
+    public void WithTools_ConfigureOptions_InvalidArgs_Throws()
+    {
+        IMcpServerBuilder builder = new ServiceCollection().AddMcpServer();
+        Action<MethodInfo, McpServerToolCreateOptions> configureOptions = (_, _) => { };
+
+        Assert.Throws<ArgumentNullException>("configureOptions", () => builder.WithTools<EchoTool>(configureOptions: null!));
+        Assert.Throws<ArgumentNullException>("configureOptions", () => builder.WithTools([typeof(EchoTool)], configureOptions: null!));
+        Assert.Throws<ArgumentNullException>("configureOptions", () => builder.WithToolsFromAssembly(typeof(EchoTool).Assembly, configureOptions: null!));
+        Assert.Throws<ArgumentNullException>("toolTypes", () => builder.WithTools((IEnumerable<Type>)null!, configureOptions));
+
+        IMcpServerBuilder nullBuilder = null!;
+        Assert.Throws<ArgumentNullException>("builder", () => nullBuilder.WithTools<EchoTool>(configureOptions));
+        Assert.Throws<ArgumentNullException>("builder", () => nullBuilder.WithTools([typeof(EchoTool)], configureOptions));
+        Assert.Throws<ArgumentNullException>("builder", () => nullBuilder.WithToolsFromAssembly(typeof(EchoTool).Assembly, configureOptions));
     }
 
     [Fact]
