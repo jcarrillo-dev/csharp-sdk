@@ -1,8 +1,11 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using ModelContextProtocol.Protocol;
+using System.Buffers;
+using System.IO.Pipelines;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 
 namespace ModelContextProtocol.Server;
 
@@ -20,7 +23,10 @@ public class StreamServerTransport : TransportBase
 
     private readonly ILogger _logger;
 
-    private readonly TextReader _inputReader;
+    private static ReadOnlySpan<byte> Utf8Preamble => [0xEF, 0xBB, 0xBF];
+
+    private readonly Stream _inputStream;
+    private readonly PipeReader _inputReader;
     private readonly Stream _outputStream;
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -45,11 +51,10 @@ public class StreamServerTransport : TransportBase
 
         _logger = loggerFactory?.CreateLogger(GetType()) ?? NullLogger.Instance;
 
-#if NET
-        _inputReader = new StreamReader(inputStream, Encoding.UTF8);
-#else
-        _inputReader = new CancellableStreamReader(inputStream, Encoding.UTF8);
-#endif
+        // Messages are read as UTF-8 bytes and deserialized without materializing each line as a string.
+        // The stream is disposed by DisposeAsync, which also unblocks a pending read.
+        _inputStream = inputStream;
+        _inputReader = PipeReader.Create(inputStream, new StreamPipeReaderOptions(leaveOpen: true));
         _outputStream = outputStream;
 
         SetConnected();
@@ -99,72 +104,47 @@ public class StreamServerTransport : TransportBase
         {
             LogTransportEnteringReadMessagesLoop(Name);
 
+            bool isStartOfStream = true;
             while (!shutdownToken.IsCancellationRequested)
             {
-                var line = await _inputReader.ReadLineAsync(shutdownToken).ConfigureAwait(false);
-                if (string.IsNullOrWhiteSpace(line))
+                ReadResult result = await _inputReader.ReadAsync(shutdownToken).ConfigureAwait(false);
+                ReadOnlySequence<byte> buffer = result.Buffer;
+
+                if (isStartOfStream)
                 {
-                    if (line is null)
+                    // Like StreamReader, skip a UTF-8 byte order mark at the start of the stream.
+                    if (buffer.Length < Utf8Preamble.Length && !result.IsCompleted && StartsWithPartialPreamble(buffer))
                     {
-                        LogTransportEndOfStream(Name);
-                        break;
+                        _inputReader.AdvanceTo(buffer.Start, buffer.End);
+                        continue;
                     }
 
-                    continue;
+                    isStartOfStream = false;
+                    if (StartsWithPreamble(buffer))
+                    {
+                        buffer = buffer.Slice(Utf8Preamble.Length);
+                    }
                 }
 
-                LogTransportReceivedMessageSensitive(Name, line);
-
-                try
+                while (TryReadLine(ref buffer, out ReadOnlySequence<byte> line))
                 {
-                    if (JsonSerializer.Deserialize(line, McpJsonUtilities.DefaultOptions.GetTypeInfo(typeof(JsonRpcMessage))) is JsonRpcMessage message)
-                    {
-                        await WriteMessageAsync(message, shutdownToken).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        LogTransportMessageParseUnexpectedTypeSensitive(Name, line);
-                    }
+                    await ProcessLineAsync(line, shutdownToken).ConfigureAwait(false);
                 }
-                catch (JsonException ex)
+
+                if (result.IsCompleted)
                 {
-                    if (Logger.IsEnabled(LogLevel.Trace))
+                    // Like StreamReader.ReadLine, a final line without a line terminator is still a line.
+                    if (!buffer.IsEmpty)
                     {
-                        LogTransportMessageParseFailedSensitive(Name, line, ex);
-                    }
-                    else
-                    {
-                        LogTransportMessageParseFailed(Name, ex);
+                        await ProcessLineAsync(buffer, shutdownToken).ConfigureAwait(false);
                     }
 
-                    // Deserializing the full message failed, for example because the params object was nested
-                    // more deeply than the JSON reader's MaxDepth allows. If the message still carried a request
-                    // id, reply with a JSON-RPC parse error using that id so the caller's pending request
-                    // completes instead of hanging until it times out. If no id can be recovered, the message
-                    // was either a notification or too malformed to correlate, so we just continue reading.
-                    if (TryRecoverRequestId(line, out RequestId id))
-                    {
-                        var errorResponse = new JsonRpcError
-                        {
-                            Id = id,
-                            Error = new JsonRpcErrorDetail
-                            {
-                                Code = (int)McpErrorCode.ParseError,
-                                Message = "Failed to parse the JSON-RPC request.",
-                            },
-                        };
-
-                        try
-                        {
-                            await SendMessageAsync(errorResponse, shutdownToken).ConfigureAwait(false);
-                        }
-                        catch (Exception sendEx) when (sendEx is not OperationCanceledException)
-                        {
-                            // Swallow so a failed error-send does not tear down the read loop. No logging
-                            // here because SendMessageAsync already logs send failures before it throws.
-                        }
-                    }
+                    _inputReader.AdvanceTo(buffer.End);
+                    LogTransportEndOfStream(Name);
+                    break;
                 }
+
+                _inputReader.AdvanceTo(buffer.Start, buffer.End);
             }
         }
         catch (OperationCanceledException)
@@ -178,9 +158,190 @@ public class StreamServerTransport : TransportBase
         }
         finally
         {
+            await _inputReader.CompleteAsync().ConfigureAwait(false);
             SetDisconnected(error);
         }
     }
+
+    private async ValueTask ProcessLineAsync(ReadOnlySequence<byte> line, CancellationToken shutdownToken)
+    {
+        if (IsWhiteSpace(line))
+        {
+            return;
+        }
+
+        if (Logger.IsEnabled(LogLevel.Trace))
+        {
+            LogTransportReceivedMessageSensitive(Name, GetString(line));
+        }
+
+        JsonRpcMessage? message;
+        RequestId failedRequestId = default;
+        bool hasFailedRequestId = false;
+        try
+        {
+            message = Deserialize(line, (JsonTypeInfo<JsonRpcMessage>)McpJsonUtilities.DefaultOptions.GetTypeInfo(typeof(JsonRpcMessage)));
+        }
+        catch (JsonException ex)
+        {
+            message = null;
+
+            if (Logger.IsEnabled(LogLevel.Trace))
+            {
+                LogTransportMessageParseFailedSensitive(Name, GetString(line), ex);
+            }
+            else
+            {
+                LogTransportMessageParseFailed(Name, ex);
+            }
+
+            // Deserializing the full message failed, for example because the params object was nested
+            // more deeply than the JSON reader's MaxDepth allows. If the message still carried a request
+            // id, reply with a JSON-RPC parse error using that id so the caller's pending request
+            // completes instead of hanging until it times out. If no id can be recovered, the message
+            // was either a notification or too malformed to correlate, so we just continue reading.
+            hasFailedRequestId = TryRecoverRequestId(line, out failedRequestId);
+            if (!hasFailedRequestId)
+            {
+                return;
+            }
+        }
+
+        // The line is not used after this point, so the caller may release the buffer that backs it.
+        if (message is not null)
+        {
+            await WriteMessageAsync(message, shutdownToken).ConfigureAwait(false);
+        }
+        else if (hasFailedRequestId)
+        {
+            var errorResponse = new JsonRpcError
+            {
+                Id = failedRequestId,
+                Error = new JsonRpcErrorDetail
+                {
+                    Code = (int)McpErrorCode.ParseError,
+                    Message = "Failed to parse the JSON-RPC request.",
+                },
+            };
+
+            try
+            {
+                await SendMessageAsync(errorResponse, shutdownToken).ConfigureAwait(false);
+            }
+            catch (Exception sendEx) when (sendEx is not OperationCanceledException)
+            {
+                // Swallow so a failed error-send does not tear down the read loop. No logging
+                // here because SendMessageAsync already logs send failures before it throws.
+            }
+        }
+        else if (Logger.IsEnabled(LogLevel.Trace))
+        {
+            LogTransportMessageParseUnexpectedTypeSensitive(Name, GetString(line));
+        }
+    }
+
+    /// <summary>
+    /// Deserializes a single JSON-RPC message from a line of UTF-8 bytes.
+    /// </summary>
+    /// <remarks>
+    /// This has the same behavior as <see cref="JsonSerializer.Deserialize(string, JsonTypeInfo)"/>: the reader options
+    /// come from the serializer options, and anything other than whitespace after the message is rejected.
+    /// </remarks>
+    private static JsonRpcMessage? Deserialize(ReadOnlySequence<byte> line, JsonTypeInfo<JsonRpcMessage> typeInfo)
+    {
+        if (line.IsSingleSegment)
+        {
+            return JsonSerializer.Deserialize(line.First.Span, typeInfo);
+        }
+
+        JsonSerializerOptions options = typeInfo.Options;
+        var reader = new Utf8JsonReader(line, new JsonReaderOptions
+        {
+            AllowTrailingCommas = options.AllowTrailingCommas,
+            CommentHandling = options.ReadCommentHandling,
+            MaxDepth = options.MaxDepth,
+        });
+
+        JsonRpcMessage? message = JsonSerializer.Deserialize(ref reader, typeInfo);
+
+        // Reading past the message either returns false (only whitespace remains) or throws a JsonException.
+        if (reader.Read())
+        {
+            throw new JsonException("The JSON-RPC message is followed by additional data.");
+        }
+
+        return message;
+    }
+
+    /// <summary>
+    /// Splits the next line off <paramref name="buffer"/>, treating '\n', '\r' and "\r\n" as line terminators
+    /// like <see cref="TextReader.ReadLine"/> does. A "\r\n" pair yields an additional empty line, which is skipped.
+    /// </summary>
+    private static bool TryReadLine(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> line)
+    {
+        long offset = 0;
+        foreach (ReadOnlyMemory<byte> segment in buffer)
+        {
+            int index = segment.Span.IndexOfAny((byte)'\n', (byte)'\r');
+            if (index >= 0)
+            {
+                SequencePosition end = buffer.GetPosition(offset + index);
+                line = buffer.Slice(0, end);
+                buffer = buffer.Slice(buffer.GetPosition(1, end));
+                return true;
+            }
+
+            offset += segment.Length;
+        }
+
+        line = default;
+        return false;
+    }
+
+    /// <summary>Gets whether a line has the same meaning as a line for which <see cref="string.IsNullOrWhiteSpace"/> is true.</summary>
+    private static bool IsWhiteSpace(ReadOnlySequence<byte> line)
+    {
+        bool hasNonAscii = false;
+        foreach (ReadOnlyMemory<byte> segment in line)
+        {
+            foreach (byte b in segment.Span)
+            {
+                if (b >= 0x80)
+                {
+                    hasNonAscii = true;
+                }
+                else if (!char.IsWhiteSpace((char)b))
+                {
+                    return false;
+                }
+            }
+        }
+
+        // Only non-ASCII bytes are left to check; this is rare, so decode them.
+        return !hasNonAscii || string.IsNullOrWhiteSpace(GetString(line));
+    }
+
+    private static bool StartsWithPreamble(ReadOnlySequence<byte> buffer)
+    {
+        if (buffer.Length < Utf8Preamble.Length)
+        {
+            return false;
+        }
+
+        Span<byte> start = stackalloc byte[3];
+        buffer.Slice(0, Utf8Preamble.Length).CopyTo(start);
+        return start.SequenceEqual(Utf8Preamble);
+    }
+
+    private static bool StartsWithPartialPreamble(ReadOnlySequence<byte> buffer)
+    {
+        Span<byte> start = stackalloc byte[3];
+        int length = (int)buffer.Length;
+        buffer.CopyTo(start);
+        return start.Slice(0, length).SequenceEqual(Utf8Preamble.Slice(0, length));
+    }
+
+    private static string GetString(ReadOnlySequence<byte> line) => Encoding.UTF8.GetString(line.ToArray());
 
     /// <summary>
     /// Attempts to recover the JSON-RPC request id from a line that failed full deserialization.
@@ -189,14 +350,13 @@ public class StreamServerTransport : TransportBase
     /// This walks only the top-level object looking for an "id" property and skips every other value,
     /// using a large reader depth so a deeply nested "params" value cannot make recovery itself fail.
     /// </remarks>
-    private static bool TryRecoverRequestId(string line, out RequestId id)
+    private static bool TryRecoverRequestId(ReadOnlySequence<byte> line, out RequestId id)
     {
         id = default;
 
         try
         {
-            byte[] utf8 = Encoding.UTF8.GetBytes(line);
-            var reader = new Utf8JsonReader(utf8, new JsonReaderOptions
+            var reader = new Utf8JsonReader(line, new JsonReaderOptions
             {
                 // Use the maximum reader depth so that an over-nested "params" value cannot make id
                 // recovery throw for the same reason the original parse did.
@@ -279,7 +439,7 @@ public class StreamServerTransport : TransportBase
 
             // Dispose of stdin/out. Cancellation may not be able to wake up operations
             // synchronously blocked in a syscall; we need to forcefully close the handle / file descriptor.
-            _inputReader?.Dispose();
+            _inputStream.Dispose();
             _outputStream?.Dispose();
 
             // Make sure the work has quiesced.

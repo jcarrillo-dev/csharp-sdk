@@ -365,4 +365,110 @@ public class StdioServerTransportTests : LoggedTest
         Assert.NotEmpty(traceLogMessages);
         Assert.Contains(traceLogMessages, x => x.Message.Contains("\"method\":\"test\"") && x.Message.Contains("\"id\":99"));
     }
+
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    [InlineData("\r")]
+    public async Task ReadMessagesAsync_Should_Split_Lines_Like_ReadLine(string newLine)
+    {
+        string input =
+            Request(1) + newLine +
+            "   \t" + newLine +
+            newLine +
+            Request(2) + newLine +
+            " " + newLine +
+            Request(3); // The last line has no line terminator.
+
+        var messages = await ReadAllMessagesAsync(Encoding.UTF8.GetBytes(input));
+
+        Assert.Equal(["1", "2", "3"], messages.Select(m => ((JsonRpcRequest)m).Id.ToString()));
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Read_Message_Written_One_Byte_At_A_Time()
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(Request(7, "pé \\\"x\\\"") + "\n");
+
+        var messages = await ReadAllMessagesAsync(bytes.Select(b => new[] { b }).ToArray());
+
+        var request = Assert.IsType<JsonRpcRequest>(Assert.Single(messages));
+        Assert.Equal("7", request.Id.ToString());
+        Assert.Equal("pé \"x\"", request.Params?["value"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Read_Message_Larger_Than_Read_Buffer()
+    {
+        string value = new('a', 100_000);
+
+        var messages = await ReadAllMessagesAsync(Encoding.UTF8.GetBytes(Request(8, value) + "\n" + Request(9) + "\n"));
+
+        Assert.Equal(2, messages.Count);
+        Assert.Equal(value, ((JsonRpcRequest)messages[0]).Params?["value"]?.GetValue<string>());
+        Assert.Equal("9", ((JsonRpcRequest)messages[1]).Id.ToString());
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Skip_Utf8_Byte_Order_Mark()
+    {
+        byte[] message = Encoding.UTF8.GetBytes(Request(10) + "\n");
+
+        var messages = await ReadAllMessagesAsync([0xEF, 0xBB], [0xBF], message);
+
+        Assert.Equal("10", ((JsonRpcRequest)Assert.Single(messages)).Id.ToString());
+    }
+
+    [Theory]
+    [InlineData(10)]
+    [InlineData(100_000)]
+    public async Task ReadMessagesAsync_Should_Reject_Data_After_Message(int valueLength)
+    {
+        string value = new('a', valueLength);
+        string input = Request(11, value) + " " + Request(12) + "\n" + Request(13) + "\n";
+
+        var messages = await ReadAllMessagesAsync(Encoding.UTF8.GetBytes(input));
+
+        // The first line holds two JSON values, so it fails to parse, as it does with JsonSerializer.Deserialize(string).
+        Assert.Equal("13", ((JsonRpcRequest)Assert.Single(messages)).Id.ToString());
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Complete_At_End_Of_Stream()
+    {
+        var messages = await ReadAllMessagesAsync();
+
+        Assert.Empty(messages);
+    }
+
+    private static string Request(int id, string? value = null) =>
+        value is null
+            ? $"{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"test\"}}"
+            : $"{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"test\",\"params\":{{\"value\":\"{value}\"}}}}";
+
+    private async Task<List<JsonRpcMessage>> ReadAllMessagesAsync(params byte[][] chunks)
+    {
+        Pipe pipe = new();
+        using var input = pipe.Reader.AsStream();
+
+        await using var transport = new StreamServerTransport(
+            input,
+            Stream.Null,
+            loggerFactory: LoggerFactory);
+
+        foreach (byte[] chunk in chunks)
+        {
+            await pipe.Writer.WriteAsync(chunk, TestContext.Current.CancellationToken);
+        }
+
+        await pipe.Writer.CompleteAsync();
+
+        List<JsonRpcMessage> messages = [];
+        await foreach (var message in transport.MessageReader.ReadAllAsync(TestContext.Current.CancellationToken))
+        {
+            messages.Add(message);
+        }
+
+        return messages;
+    }
 }
