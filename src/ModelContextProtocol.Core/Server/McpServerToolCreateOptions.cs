@@ -183,6 +183,12 @@ public sealed class McpServerToolCreateOptions
     /// services, which can resolve <see cref="RequestContext{TParams}"/> for the current request.
     /// </para>
     /// <para>
+    /// A value returned by a <see cref="AIFunctionFactoryOptions.ParameterBindingOptions.BindParameter"/> delegate from this
+    /// property that implements <see cref="IAsyncDisposable"/> or <see cref="IDisposable"/> is disposed when the invocation ends,
+    /// in reverse order of binding, including when the tool throws or when binding a later parameter fails. Values bound by the
+    /// SDK, such as services, are not disposed.
+    /// </para>
+    /// <para>
     /// This property is only used when the tool is created from a method. It is ignored when the tool is created from an existing
     /// <see cref="AIFunction"/>.
     /// </para>

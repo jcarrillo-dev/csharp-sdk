@@ -4,6 +4,7 @@ using ModelContextProtocol.Protocol;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
@@ -81,7 +82,10 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             {
                 if (options?.ConfigureParameterBinding?.Invoke(pi) is { } userBinding && userBinding != default)
                 {
-                    return userBinding;
+                    // Values returned by the server's own binder are disposed when the invocation ends.
+                    return userBinding.BindParameter is { } bindParameter
+                        ? userBinding with { BindParameter = (pi, args) => TrackBoundArgument(args, bindParameter(pi, args)) }
+                        : userBinding;
                 }
 
                 if (RequestServiceProvider<CallToolRequestParams>.IsAugmentedWith(pi.ParameterType) ||
@@ -290,53 +294,123 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             }
         }
 
-        object? result;
-        result = await AIFunction.InvokeAsync(arguments, cancellationToken).ConfigureAwait(false);
-
-        JsonElement? structuredContent = CreateStructuredResponse(result, request.Server.NegotiatedProtocolVersion);
-        return result switch
+        try
         {
-            AIContent aiContent => new()
+            object? result;
+            result = await AIFunction.InvokeAsync(arguments, cancellationToken).ConfigureAwait(false);
+
+            JsonElement? structuredContent = CreateStructuredResponse(result, request.Server.NegotiatedProtocolVersion);
+            return result switch
             {
-                Content = [aiContent.ToContentBlock()],
-                StructuredContent = structuredContent,
-                IsError = aiContent is ErrorContent
-            },
+                AIContent aiContent => new()
+                {
+                    Content = [aiContent.ToContentBlock()],
+                    StructuredContent = structuredContent,
+                    IsError = aiContent is ErrorContent
+                },
 
-            null => new()
+                null => new()
+                {
+                    Content = [],
+                    StructuredContent = structuredContent,
+                },
+
+                string text => new()
+                {
+                    Content = [new TextContentBlock { Text = text }],
+                    StructuredContent = structuredContent,
+                },
+
+                ContentBlock content => new()
+                {
+                    Content = [content],
+                    StructuredContent = structuredContent,
+                },
+
+                IEnumerable<AIContent> contentItems => ConvertAIContentEnumerableToCallToolResult(contentItems, structuredContent),
+
+                IEnumerable<ContentBlock> contents => new()
+                {
+                    Content = [.. contents],
+                    StructuredContent = structuredContent,
+                },
+
+                CallToolResult callToolResponse => callToolResponse,
+
+                _ => new()
+                {
+                    Content = [new TextContentBlock { Text = JsonSerializer.Serialize(result, AIFunction.JsonSerializerOptions.GetTypeInfo(typeof(object))) }],
+                    StructuredContent = structuredContent,
+                },
+            };
+        }
+        finally
+        {
+            await DisposeBoundArgumentsAsync(arguments).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Key under which <see cref="AIFunctionArguments.Context"/> holds the values to dispose when the invocation ends.</summary>
+    private static readonly object s_boundArgumentsKey = new();
+
+    /// <summary>
+    /// Records <paramref name="value"/>, returned by a binder from <see cref="McpServerToolCreateOptions.ConfigureParameterBinding"/>,
+    /// to be disposed when the invocation ends if it is <see cref="IDisposable"/> or <see cref="IAsyncDisposable"/>.
+    /// </summary>
+    private static object? TrackBoundArgument(AIFunctionArguments arguments, object? value)
+    {
+        if (value is IAsyncDisposable or IDisposable)
+        {
+            var context = arguments.Context ??= new Dictionary<object, object?>();
+            if (!context.TryGetValue(s_boundArgumentsKey, out object? list) || list is not List<object> values)
             {
-                Content = [],
-                StructuredContent = structuredContent,
-            },
+                context[s_boundArgumentsKey] = values = [];
+            }
 
-            string text => new()
+            values.Add(value);
+        }
+
+        return value;
+    }
+
+    /// <summary>
+    /// Disposes, in reverse order, the values recorded by <see cref="TrackBoundArgument"/> for this invocation.
+    /// </summary>
+    /// <remarks>
+    /// Every value is disposed even if disposing another one throws; the first exception is rethrown afterwards.
+    /// </remarks>
+    private static async ValueTask DisposeBoundArgumentsAsync(AIFunctionArguments arguments)
+    {
+        if (arguments.Context is null ||
+            !arguments.Context.TryGetValue(s_boundArgumentsKey, out object? list) ||
+            list is not List<object> values)
+        {
+            return;
+        }
+
+        arguments.Context.Remove(s_boundArgumentsKey);
+
+        ExceptionDispatchInfo? firstException = null;
+        for (int i = values.Count - 1; i >= 0; i--)
+        {
+            try
             {
-                Content = [new TextContentBlock { Text = text }],
-                StructuredContent = structuredContent,
-            },
-
-            ContentBlock content => new()
+                if (values[i] is IAsyncDisposable asyncDisposable)
+                {
+                    await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                }
+                else
+                {
+                    ((IDisposable)values[i]).Dispose();
+                }
+            }
+            catch (Exception ex)
             {
-                Content = [content],
-                StructuredContent = structuredContent,
-            },
+                firstException ??= ExceptionDispatchInfo.Capture(ex);
+            }
+        }
 
-            IEnumerable<AIContent> contentItems => ConvertAIContentEnumerableToCallToolResult(contentItems, structuredContent),
-
-            IEnumerable<ContentBlock> contents => new()
-            {
-                Content = [.. contents],
-                StructuredContent = structuredContent,
-            },
-
-            CallToolResult callToolResponse => callToolResponse,
-
-            _ => new()
-            {
-                Content = [new TextContentBlock { Text = JsonSerializer.Serialize(result, AIFunction.JsonSerializerOptions.GetTypeInfo(typeof(object))) }],
-                StructuredContent = structuredContent,
-            },
-        };
+        firstException?.Throw();
     }
 
     /// <summary>Creates a name to use based on the supplied method and naming policy.</summary>
