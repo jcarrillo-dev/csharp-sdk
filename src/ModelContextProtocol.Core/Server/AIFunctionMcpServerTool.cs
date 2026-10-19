@@ -79,6 +79,11 @@ internal sealed partial class AIFunctionMcpServerTool : McpServerTool
             JsonSchemaCreateOptions = options?.SchemaCreateOptions,
             ConfigureParameterBinding = pi =>
             {
+                if (options?.ConfigureParameterBinding?.Invoke(pi) is { } userBinding && userBinding != default)
+                {
+                    return userBinding;
+                }
+
                 if (RequestServiceProvider<CallToolRequestParams>.IsAugmentedWith(pi.ParameterType) ||
                     (options?.Services?.GetService<IServiceProviderIsService>() is { } ispis &&
                      ispis.IsService(pi.ParameterType)))

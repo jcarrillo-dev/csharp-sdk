@@ -2,6 +2,7 @@ using Microsoft.Extensions.AI;
 using ModelContextProtocol.Protocol;
 using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -166,6 +167,29 @@ public sealed class McpServerToolCreateOptions
     public AIJsonSchemaCreateOptions? SchemaCreateOptions { get; set; }
 
     /// <summary>
+    /// Gets or sets a delegate used to determine how a parameter of the tool method is bound when the tool is invoked.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The delegate is invoked once for each parameter of the method when the tool is created, before the SDK applies its own
+    /// binding rules. If it returns a <see cref="AIFunctionFactoryOptions.ParameterBindingOptions"/> other than
+    /// <see langword="default"/>, that binding is used for the parameter. If it returns <see langword="default"/>, the SDK binds the
+    /// parameter as usual (for example, <see cref="RequestContext{TParams}"/>, <see cref="McpServer"/>, services from
+    /// <see cref="Services"/>, or the JSON argument).
+    /// </para>
+    /// <para>
+    /// A <see cref="AIFunctionFactoryOptions.ParameterBindingOptions.BindParameter"/> delegate receives the raw tool arguments,
+    /// with each argument value as a <see cref="JsonElement"/>, and <see cref="AIFunctionArguments.Services"/> set to the request
+    /// services, which can resolve <see cref="RequestContext{TParams}"/> for the current request.
+    /// </para>
+    /// <para>
+    /// This property is only used when the tool is created from a method. It is ignored when the tool is created from an existing
+    /// <see cref="AIFunction"/>.
+    /// </para>
+    /// </remarks>
+    public Func<ParameterInfo, AIFunctionFactoryOptions.ParameterBindingOptions>? ConfigureParameterBinding { get; set; }
+
+    /// <summary>
     /// Gets or sets the metadata associated with the tool.
     /// </summary>
     /// <remarks>
@@ -215,6 +239,7 @@ public sealed class McpServerToolCreateOptions
             OutputSchema = OutputSchema,
             SerializerOptions = SerializerOptions,
             SchemaCreateOptions = SchemaCreateOptions,
+            ConfigureParameterBinding = ConfigureParameterBinding,
             Metadata = Metadata,
             Icons = Icons,
             Meta = Meta,
